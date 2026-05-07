@@ -84,7 +84,7 @@ The wizard covers assets, strategy groups, paper/live mode, per-strategy capital
 Manual config rules:
 
 - Strategy entries need `id`, `type`, `script`, `args`, `capital`, `max_drawdown_pct`, `interval_seconds`.
-- `StrategyConfig.Params` is a JSON object of overrides; runtime params (e.g., funding rates) take priority.
+- `open_strategy` and each entry in `close_strategies` are objects of shape `{"name": "<id>", "params": {...}}` (#640/#642). Per-evaluator params (e.g. `tiered_tp_atr`'s `tiers`) live on the matching close ref, not on the strategy. Pre-v13 configs with a flat `params` map and string-typed `open_strategy`/`close_strategies` are migrated automatically on next start (synchronous, no DM); flat keys split per close-strategy ownership and everything else stays on the open ref.
 - `discord.channels` / `telegram.channels` keys: `spot`, `options`, `hyperliquid`, `topstep`, `robinhood`, `okx`, `luno`, plus optional paper keys (e.g., `okx-paper`).
 - `summary_frequency`: same key scheme. Values: `hourly`, `daily`, `every`, `per_check`, `always`, or Go durations (`30m`, `2h`). Wall-clock cadence persisted in SQLite (`app_state.last_summary_post`); survives restart/SIGHUP.
 - Trades always force an immediate summary post regardless of cadence.
@@ -209,6 +209,7 @@ When in doubt, treat as runtime default and prompt. Regenerate from `git log --o
 - `config_version` bump, deprecated field removal, silent field copy (e.g. v10 `sizing_leverage` ← `leverage`)
 - v11 no-op bump (#546)
 - `disable_implicit_close` removed in #508 — `true` + no `close_strategies` now uses implicit open-strategy close
+- **v12 → v13 co-located strategy refs (#640/#642)** — `open_strategy: "name"` rewritten to `{"name":..., "params":{...}}`; `close_strategies: ["a","b"]` rewritten to `[{"name":"a","params":{...}}, ...]`; flat `params` map split between the open ref and each close ref by ownership (`tiered_tp_atr.tiers`, `tp_at_pct.pct`, etc. routed to the matching close ref). `args[0]` falls back as the open name; `type=manual` defaults to `"hold"`. Migration runs synchronously inside `LoadConfig` and rewrites the JSON file. Pre-v13 backtests via `--config` are rejected with a hint to start the live binary once for migration.
 
 **Runtime default**
 - HL stop-loss auto-derive from `max_drawdown_pct` (#493); margin mode default `isolated` (#486)
@@ -234,6 +235,7 @@ When in doubt, treat as runtime default and prompt. Regenerate from `git log --o
 - **HL TP tier residual eliminated (#629)** — non-final tiers pre-floored to lot precision; final tier absorbs the remainder via integer-lot subtraction (`floor_size(size) - sum(non-final floors)`) so per-tier truncation can't strand an uncovered residual. Virtual qty normalized via `adapter.round_size` first to absorb Go float drift; sub-lot result skips the tier block with `[INFO]` log
 - **Manual-open SL+TP placed inline (#633)** — was: SL armed immediately, TP[n] reduce-only orders deferred to the next scheduler cycle (and both skipped entirely if `--atr` omitted). Now: `placeManualProtectionInline` runs `--sync-protection` immediately after the fill, returning TP OIDs that round-trip via `pending_manual_actions.tp_oids_json`. `--atr` is optional — fallback `0.1*fillPrice/leverage` arms SL@1×ATR + TPs when omitted; operator notified via owner DM if fallback can't be computed (no leverage / no fill price)
 - **Manual-open queue-failure cleanup (#635)** — when `InsertPendingManualAction` fails after a successful on-chain fill (disk full, DB locked), `attemptManualOpenCleanup` flattens the position via reduce-only market close sized to `fillQty` and cancels SL + TP OIDs in the same call; sized so peer manual/perps positions on the same coin are preserved; skipped under `--record-only`. Cleanup failures notify loudly — operator must flatten manually if both queue insert and cleanup fail
+- **Discord SL line shows ATR multiplier (#638) + ATR before SL ordering (#639)** — open trade DMs and per-position summary extras now read `ATR | SL [×Nmult] | TP[i] | leverage`; sole-owner fixed-ATR stops display the multiplier next to the SL price so operators can confirm the configured `stop_loss_atr_mult` from the alert without checking config
 
 **Opt-in field**
 - `trailing_stop_pct` (#502); `trailing_stop_atr_mult` (#507 — initial trigger deferred one cycle)
@@ -251,6 +253,7 @@ When in doubt, treat as runtime default and prompt. Regenerate from `git log --o
 - Backtester close registry with `--close-strategy`/`--close-params` (#535)
 - HL adapter `cancel_trigger_order` → `cancel_order_by_oid` with backward-compat alias (#604)
 - `shared_tools/hl_user_fills.py` consolidates fee-lookup helpers shared by `check_hyperliquid.py` and `close_hyperliquid_position.py` (#603/#598)
+- **Backtester API aligned with co-located refs (#641/#643)** — `Backtester(open_strategy={"name":..., "params":...}, close_strategies=[{"name":..., "params":...}])` mirrors the live `StrategyConfig` shape. `run_backtest.py --close-strategy` now accepts both bare names and JSON refs and is repeatable; **`--close-params` is removed** — fold params into the JSON ref. New `--config <path> --strategy <id>` flow imports a single strategy from a v13+ live config and uses its open + close refs verbatim (single-mode only; compare/multi/optimize rejected upfront).
 
 **Open-position constraint**
 - `margin_mode`, exchange `leverage`, kill-switch identity changes
@@ -467,9 +470,17 @@ Use `.venv/bin/python3` for all backtests.
 .venv/bin/python3 backtest/run_backtest.py --strategy momentum --symbol BTC/USDT --timeframe 1h --mode optimize
 .venv/bin/python3 backtest/run_backtest.py --strategy momentum --symbol BTC/USDT --timeframe 1h --since 90
 
-# Close-strategy registry (#535) — repeatable; max close_fraction wins
+# Close-strategy registry (#535/#641) — repeatable; max close_fraction wins.
+# --close-strategy accepts both bare names and JSON refs ({"name","params"}).
+# --close-params is removed — fold params into the JSON ref.
 .venv/bin/python3 backtest/run_backtest.py --strategy momentum --symbol BTC/USDT --timeframe 1h \
-  --close-strategy tiered_tp_atr --close-params '{"tiered_tp_atr":{"tp1_mult":1,"tp2_mult":2}}'
+  --close-strategy tp_at_pct \
+  --close-strategy '{"name":"tiered_tp_atr","params":{"tiers":[{"atr_multiple":1,"close_fraction":0.5},{"atr_multiple":2,"close_fraction":1.0}]}}'
+
+# Backtest a live strategy verbatim (single mode only) — pulls the strategy's
+# open + close refs from the live config (#643). Pre-v13 configs are rejected.
+.venv/bin/python3 backtest/run_backtest.py --config scheduler/config.json --strategy hl-btc-momentum \
+  --symbol BTC/USDT --timeframe 1h --mode single
 
 # Regime gate (#549) — blocks entries outside allowed regimes; closes always execute
 .venv/bin/python3 backtest/run_backtest.py --strategy momentum --symbol BTC/USDT --timeframe 1h \
@@ -532,7 +543,8 @@ Per-strategy:
 | Max drawdown | `max_drawdown_pct` | Strategy CB |
 | Interval | `interval_seconds` | 0 uses global; auto-accelerates in DD warn band |
 | HTF filter | `htf_filter` | Skips counter-trend signals |
-| Params | `params` | Strategy default overrides |
+| Open strategy params | `open_strategy.params` | Per-open overrides; no longer a flat top-level `params` map (#640). Migrated from legacy on first start |
+| Close strategy params | `close_strategies[i].params` | Per-close evaluator overrides (e.g. `tiered_tp_atr.tiers`); each ref carries its own params so they don't leak into the open strategy |
 | Allow shorts | `allow_shorts` | Required for bidirectional perps |
 | Stop loss (price %) | `stop_loss_pct` | HL perps. Sole-owner auto-derives from `max_drawdown_pct` (cap 50) when omitted; same-coin peers need one explicit positive owner. `0` opts out. |
 | Stop loss (margin %) | `stop_loss_margin_pct` | HL perps — leverage-aware; mutually exclusive with the other four owners. `0` opts out. |
@@ -548,7 +560,7 @@ Per-strategy:
 | Close strategies | `close_strategies` | Ordered list; max `close_fraction` wins |
 | Regime gate | `allowed_regimes` | Labels allowing entries (`trending_up`, `trending_down`, `ranging`); empty = allow all; needs `regime.enabled=true`; not on type=options |
 | Theta harvest | `theta_harvest.*` | Options early-exit |
-| HL on-chain TP tiers | `params.tiers` | HL perps + `tiered_tp_atr` / `tiered_tp_atr_live` only — list of `{atr_multiple, close_fraction}` (cumulative). Default `[{1×,0.5},{2×,1.0}]`; final tier coerced to 1.0 so on-chain TPs sum to full position; non-numeric rejected per tier. Configuring tiers auto-suppresses the in-process `tiered_tp_atr*` close evaluator (#604/#615). |
+| HL on-chain TP tiers | `close_strategies[i].params.tiers` (where ref is `tiered_tp_atr` or `tiered_tp_atr_live`) | HL perps only — list of `{atr_multiple, close_fraction}` (cumulative). Default `[{1×,0.5},{2×,1.0}]`; final tier coerced to 1.0 so on-chain TPs sum to full position; non-numeric rejected per tier. Configuring tiers auto-suppresses the in-process `tiered_tp_atr*` close evaluator (#604/#615). Pre-v13 configs with flat `params.tiers` are routed to the matching close ref by `closeStrategyOwnedKeys` on migration (#640). |
 
 Discord/Telegram:
 
