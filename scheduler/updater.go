@@ -55,9 +55,8 @@ func checkForUpdates(cfg *Config, notifier *MultiNotifier, lastNotifiedHash *str
 
 	commitLog, _ := gitLog("HEAD", "origin/main")
 	newTag, _ := gitDescribeExact("origin/main")
-	goChanged, _ := gitDiffHasFiles("HEAD", "origin/main", "scheduler/")
 
-	msg := formatUpdateMessage(localHash, remoteHash, commitLog, newTag, goChanged)
+	msg := formatUpdateMessage(localHash, remoteHash, commitLog, newTag)
 
 	if notifier != nil && notifier.HasBackends() {
 		notifier.SendToAllChannels(msg)
@@ -84,37 +83,24 @@ func checkForUpdates(cfg *Config, notifier *MultiNotifier, lastNotifiedHash *str
 	return true
 }
 
-// applyUpgrade performs git pull, rebuild, and restart after user confirmation.
+// applyUpgrade runs scripts/update.sh (atomic git pull + uv sync + go build) and
+// then saves state and restarts. The script is invoked without --restart so this
+// function retains control of the state-save + restartSelf() ordering.
 func applyUpgrade(notifier *MultiNotifier, mu *sync.RWMutex, state *AppState, cfg *Config, stateDB *StateDB) {
 	notifier.SendOwnerDM("Starting upgrade...")
 
-	// Step 1: git pull --ff-only
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 5min covers a cold uv sync + go build on a slow VPS; killing mid-build
+	// leaves the worktree at the new SHA but no rebuilt binary, which the
+	// startup probe then catches on next start.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "git", "pull", "--ff-only").CombinedOutput()
+	cmd := exec.CommandContext(ctx, "bash", "scripts/update.sh")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		notifier.SendOwnerDM(fmt.Sprintf("**git pull failed**:\n```\n%s\n```\n%v", strings.TrimSpace(string(out)), err))
+		notifier.SendOwnerDM(fmt.Sprintf("**update.sh failed**:\n```\n%s\n```\n%v", tailForDM(string(out), 1500), err))
 		return
 	}
-	notifier.SendOwnerDM(fmt.Sprintf("git pull OK:\n```\n%s\n```", strings.TrimSpace(string(out))))
-
-	// Step 2: rebuild
-	goBinary, err := exec.LookPath("go")
-	if err != nil {
-		goBinary = "/opt/homebrew/bin/go"
-	}
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel2()
-	ver := resolveBuildVersion()
-	buildArgs := []string{"build", "-ldflags", "-X main.Version=" + ver, "-o", "../go-trader", "."}
-	buildCmd := exec.CommandContext(ctx2, goBinary, buildArgs...)
-	buildCmd.Dir = "scheduler"
-	buildOut, buildErr := buildCmd.CombinedOutput()
-	if buildErr != nil {
-		notifier.SendOwnerDM(fmt.Sprintf("**Build failed**:\n```\n%s\n```\n%v", strings.TrimSpace(string(buildOut)), buildErr))
-		return
-	}
-	notifier.SendOwnerDM("Build OK. Saving state and restarting...")
+	notifier.SendOwnerDM(fmt.Sprintf("update.sh OK:\n```\n%s\n```\nSaving state and restarting...", tailForDM(string(out), 1500)))
 
 	// Step 3: save state safely
 	mu.Lock()
@@ -130,6 +116,17 @@ func applyUpgrade(notifier *MultiNotifier, mu *sync.RWMutex, state *AppState, cf
 	if err := restartSelf(); err != nil {
 		fmt.Printf("[upgrade] Restart failed: %v\n", err)
 	}
+}
+
+// tailForDM trims s to the last max bytes (with a leading "...truncated..."
+// marker) so update output stays inside Discord's 2000-char DM limit. uv sync
+// can be chatty on first install; without trimming the DM gets rejected.
+func tailForDM(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return "...truncated...\n" + s[len(s)-max:]
 }
 
 // restartSelf attempts to restart the process via systemctl, then falls back to syscall.Exec.
@@ -191,17 +188,8 @@ func gitDescribeExact(ref string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// gitDiffHasFiles returns true if any files under the given path prefix changed between from and to.
-func gitDiffHasFiles(from, to, prefix string) (bool, error) {
-	out, err := exec.Command("git", "diff", "--name-only", from, to, "--", prefix).Output()
-	if err != nil {
-		return false, err
-	}
-	return strings.TrimSpace(string(out)) != "", nil
-}
-
 // formatUpdateMessage builds the Discord notification message for an available update.
-func formatUpdateMessage(localHash, remoteHash, commitLog, newTag string, goChanged bool) string {
+func formatUpdateMessage(localHash, remoteHash, commitLog, newTag string) string {
 	var sb strings.Builder
 
 	if newTag != "" {
@@ -225,11 +213,8 @@ func formatUpdateMessage(localHash, remoteHash, commitLog, newTag string, goChan
 	}
 
 	sb.WriteString("To update:\n```\n")
-	sb.WriteString("cd /path/to/go-trader && git pull --ff-only\n")
-	if goChanged {
-		sb.WriteString("cd scheduler && go build -ldflags \"-X main.Version=$(git describe --tags --always --dirty=-mod)\" -o ../go-trader . && cd ..\n")
-	}
-	sb.WriteString("systemctl restart go-trader\n```")
+	sb.WriteString("cd /path/to/go-trader && bash scripts/update.sh --restart\n")
+	sb.WriteString("```")
 
 	return sb.String()
 }
