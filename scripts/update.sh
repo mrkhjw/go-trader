@@ -20,8 +20,18 @@
 
 set -euo pipefail
 
+trim_space() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
 restart=0
-service_unit="${GO_TRADER_SERVICE:-go-trader}"
+service_unit="$(trim_space "${GO_TRADER_SERVICE:-}")"
+if [[ -z "$service_unit" ]]; then
+    service_unit="go-trader"
+fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --restart)
@@ -29,23 +39,30 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --unit|--service)
-            if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+            if [[ $# -lt 2 ]]; then
                 echo "$1 requires a systemd unit name" >&2
                 exit 2
             fi
-            service_unit="$2"
+            unit_arg="$(trim_space "$2")"
+            if [[ -z "$unit_arg" || "$unit_arg" == --* ]]; then
+                echo "$1 requires a systemd unit name" >&2
+                exit 2
+            fi
+            service_unit="$unit_arg"
             shift 2
             ;;
         --unit=*|--service=*)
-            service_unit="${1#*=}"
-            if [[ -z "$service_unit" ]]; then
+            unit_arg="$(trim_space "${1#*=}")"
+            if [[ -z "$unit_arg" || "$unit_arg" == --* ]]; then
                 echo "${1%%=*} requires a systemd unit name" >&2
                 exit 2
             fi
+            service_unit="$unit_arg"
             shift
             ;;
         -h|--help)
             echo "Usage: $0 [--restart] [--unit <systemd-unit>]"
+            echo "       $0 [--restart] [--service <systemd-unit>]"
             echo "  RESTART=1 env var also enables restart."
             echo ""
             echo "Env overrides:"
@@ -61,9 +78,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-if [[ -z "$service_unit" ]]; then
-    service_unit="go-trader"
-fi
 if [[ "${RESTART:-0}" == "1" ]]; then
     restart=1
 fi
