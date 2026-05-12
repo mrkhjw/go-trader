@@ -25,6 +25,9 @@ func TestFormatUpdateMessage(t *testing.T) {
 	if !strings.Contains(msg, "scripts/update.sh --restart") {
 		t.Error("should point operators at scripts/update.sh --restart")
 	}
+	if !strings.Contains(msg, "GO_TRADER_SERVICE=go-trader-live.service") {
+		t.Error("should mention the custom unit env override")
+	}
 	if !strings.Contains(msg, "Update Available") {
 		t.Error("should contain update header")
 	}
@@ -73,6 +76,22 @@ func TestTailForDM(t *testing.T) {
 	}
 	if len(got) > 1500+len("...truncated...\n") {
 		t.Errorf("trimmed output too long: %d", len(got))
+	}
+}
+
+func TestUpdateSystemdUnitNameDefaultsToCanonicalUnit(t *testing.T) {
+	t.Setenv("GO_TRADER_SERVICE", "")
+
+	if got := updateSystemdUnitName(); got != defaultGoTraderSystemdUnit {
+		t.Fatalf("expected default unit %q, got %q", defaultGoTraderSystemdUnit, got)
+	}
+}
+
+func TestUpdateSystemdUnitNameUsesEnvOverride(t *testing.T) {
+	t.Setenv("GO_TRADER_SERVICE", " go-trader-live.service ")
+
+	if got := updateSystemdUnitName(); got != "go-trader-live.service" {
+		t.Fatalf("expected env override to be trimmed and used, got %q", got)
 	}
 }
 

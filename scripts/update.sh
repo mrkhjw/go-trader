@@ -9,11 +9,11 @@
 #   build      — go build to go-trader.new (live binary untouched)
 #   probe      — go-trader.new probe against the just-synced Python
 #   swap       — atomic mv: live binary -> .prev, staged -> live
-#   restart    — sudo systemctl restart go-trader (only with --restart)
+#   restart    — sudo systemctl restart <unit> (only with --restart)
 #   verify     — wait active + /health version match (only with --restart)
 #   rollback   — restore .prev on verify failure (only with --restart)
 #
-# Use --restart (or RESTART=1) to restart the service after a successful build
+# Use --restart (or RESTART=1) to restart the systemd unit after a successful build
 # AND verify the running process matches the just-built version. Without
 # --restart the script stops after swap; the caller (scheduler/updater.go's
 # applyUpgrade) handles its own restart via restartSelf.
@@ -21,25 +21,49 @@
 set -euo pipefail
 
 restart=0
-for arg in "$@"; do
-    case "$arg" in
-        --restart) restart=1 ;;
+service_unit="${GO_TRADER_SERVICE:-go-trader}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --restart)
+            restart=1
+            shift
+            ;;
+        --unit|--service)
+            if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+                echo "$1 requires a systemd unit name" >&2
+                exit 2
+            fi
+            service_unit="$2"
+            shift 2
+            ;;
+        --unit=*|--service=*)
+            service_unit="${1#*=}"
+            if [[ -z "$service_unit" ]]; then
+                echo "${1%%=*} requires a systemd unit name" >&2
+                exit 2
+            fi
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--restart]"
+            echo "Usage: $0 [--restart] [--unit <systemd-unit>]"
             echo "  RESTART=1 env var also enables restart."
             echo ""
             echo "Env overrides:"
+            echo "  GO_TRADER_SERVICE=<unit> systemd unit to restart/verify (default: go-trader)"
             echo "  STATUS_PORT=<n>          override /health port (default: read from config, else 8099)"
             echo "  ACTIVE_TIMEOUT=<sec>     systemctl is-active poll timeout (default: 30)"
             echo "  HEALTH_TIMEOUT=<sec>     /health version-match poll timeout (default: 60)"
             exit 0
             ;;
         *)
-            echo "unknown arg: $arg" >&2
+            echo "unknown arg: $1" >&2
             exit 2
             ;;
     esac
 done
+if [[ -z "$service_unit" ]]; then
+    service_unit="go-trader"
+fi
 if [[ "${RESTART:-0}" == "1" ]]; then
     restart=1
 fi
@@ -173,7 +197,7 @@ echo "[update] previous binary version: ${prev_running_version:-<none>}"
 # touched by this update (binary, git tree, Python deps, running process),
 # not just the binary swap.
 pre_pull_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
-prev_main_pid=$(systemctl show -p MainPID --value go-trader 2>/dev/null || echo "")
+prev_main_pid=$(systemctl show -p MainPID --value "$service_unit" 2>/dev/null || echo "")
 # systemd reports MainPID=0 when the unit is inactive; normalize to empty
 # so the verify step doesn't try to compare against a meaningless 0.
 if [[ "$prev_main_pid" == "0" ]]; then
@@ -285,12 +309,12 @@ do_rollback() {
         fi
     fi
 
-    sudo systemctl restart go-trader || true
+    sudo systemctl restart "$service_unit" || true
     # Best-effort wait for active after rollback. We don't fail the rollback
     # itself on a slow restart — operators see the rollback marker either way.
     local waited=0
     while [[ $waited -lt $active_timeout ]]; do
-        if systemctl is-active --quiet go-trader; then
+        if systemctl is-active --quiet "$service_unit"; then
             echo "[update] rollback: previous binary active again (${prev_running_version:-unknown})"
             return
         fi
@@ -301,10 +325,10 @@ do_rollback() {
 }
 
 begin_phase restart
-sudo systemctl restart go-trader
+sudo systemctl restart "$service_unit"
 
 waited=0
-until systemctl is-active --quiet go-trader; do
+until systemctl is-active --quiet "$service_unit"; do
     if [[ $waited -ge $active_timeout ]]; then
         do_rollback "systemctl is-active timeout after ${active_timeout}s"
         fail "service did not reach active state within ${active_timeout}s"
@@ -312,7 +336,7 @@ until systemctl is-active --quiet go-trader; do
     sleep 1
     waited=$((waited + 1))
 done
-echo "[update] systemd reports active (${waited}s)"
+echo "[update] systemd reports active: $service_unit (${waited}s)"
 end_phase
 
 begin_phase verify
@@ -336,7 +360,7 @@ while [[ $waited -lt $health_timeout ]]; do
         # sufficient — the version string is git describe output, no quoting
         # ambiguity.
         if [[ "$body" == *"\"version\":\"$ver\""* ]]; then
-            cur_main_pid=$(systemctl show -p MainPID --value go-trader 2>/dev/null || echo "")
+            cur_main_pid=$(systemctl show -p MainPID --value "$service_unit" 2>/dev/null || echo "")
             if [[ "$cur_main_pid" == "0" ]]; then
                 cur_main_pid=""
             fi

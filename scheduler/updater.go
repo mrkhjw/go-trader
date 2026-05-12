@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const defaultGoTraderSystemdUnit = "go-trader"
+
 // checkForUpdates uses git fetch to check for upstream changes. If new commits are found
 // (and the remote hash differs from lastNotifiedHash), it sends a Discord channel notification
 // and, if OwnerID is configured, a DM offering to auto-upgrade.
@@ -134,7 +136,7 @@ func restartSelf() error {
 	// Try systemctl first (Linux/systemd deployments).
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := exec.CommandContext(ctx, "systemctl", "restart", "go-trader").Run(); err == nil {
+	if err := exec.CommandContext(ctx, "systemctl", "restart", updateSystemdUnitName()).Run(); err == nil {
 		// systemd will SIGTERM this process; give it time to do so.
 		time.Sleep(30 * time.Second)
 	}
@@ -145,6 +147,14 @@ func restartSelf() error {
 		return fmt.Errorf("get executable: %w", err)
 	}
 	return syscall.Exec(exe, os.Args, os.Environ())
+}
+
+func updateSystemdUnitName() string {
+	unit := strings.TrimSpace(os.Getenv("GO_TRADER_SERVICE"))
+	if unit == "" {
+		return defaultGoTraderSystemdUnit
+	}
+	return unit
 }
 
 // gitCheck verifies that git is available and the working directory is a git repo.
@@ -214,6 +224,7 @@ func formatUpdateMessage(localHash, remoteHash, commitLog, newTag string) string
 
 	sb.WriteString("To update:\n```\n")
 	sb.WriteString("cd /path/to/go-trader && bash scripts/update.sh --restart\n")
+	sb.WriteString("# custom unit: GO_TRADER_SERVICE=go-trader-live.service bash scripts/update.sh --restart\n")
 	sb.WriteString("```")
 
 	return sb.String()
