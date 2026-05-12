@@ -5,11 +5,13 @@ These tests pin the engine's look-ahead contract so future refactors can't
 silently regress it:
 
   1. Entry fill timing — signal computed on bar N fills at bar N+1's open.
-     The shift(1) at backtester.py:421 is the only thing preventing same-bar
-     fill from a signal generated at end-of-bar.
+     The ``shift(1)`` in the signal-normalization block of
+     ``Backtester.run`` is the only thing preventing same-bar fill from a
+     signal generated at end-of-bar.
   2. Regime gate timing — regime label gating entry at row N+1 must be the
      regime from bar N's closed data, not bar N+1's (#730 Gap 1). Backtester
-     shifts the regime column post-injection at backtester.py:447-452.
+     shifts the regime column post-injection in the regime-shift block of
+     ``Backtester.run``.
   3. Forward-peek contract — strategies that peek forward (e.g.
      ``signal = (close.shift(-1) > close)``) WILL inflate returns. The shift
      is not a defense against caller-side forward-peeking; it only enforces
@@ -58,9 +60,10 @@ def _step_up_df(n: int = 20, jump_bar: int = 10, jump_pct: float = 0.10) -> pd.D
 
 def test_signal_at_bar_k_fills_at_bar_k_plus_1_open():
     """Signal=1 at bar K must fill at row K+1's open price (the shift(1)
-    contract). If anyone removes the shift at backtester.py:421, this test
-    detects it: the entry would land at bar K's open (the jump) and the
-    backtest would book a +10% gain instead of ~0%.
+    contract). If anyone removes the shift in the signal-normalization
+    block of ``Backtester.run``, this test detects it: the entry would land
+    at bar K's open (the jump) and the backtest would book a +10% gain
+    instead of ~0%.
     """
     df = _step_up_df(n=20, jump_bar=10, jump_pct=0.10)
     df["signal"] = 0
@@ -80,18 +83,24 @@ def test_signal_at_bar_k_fills_at_bar_k_plus_1_open():
     # bar 9 + 1 = bar 10 = 2024-01-11
     assert entry_date == df.index[10], (
         f"Entry filled at {entry_date}, expected {df.index[10]} (bar 10 = signal_bar + 1). "
-        f"Shift-by-1 protection at backtester.py:421 may be broken."
+        f"Shift-by-1 protection in the signal-normalization block of "
+        f"Backtester.run may be broken."
     )
     assert entry_price == 100.0, f"Expected entry at bar 10's open=100, got {entry_price}"
 
 
-def test_signal_with_intra_bar_jump_does_not_capture_jump():
-    """End-to-end variant: a signal that 'magically' fires the bar BEFORE
-    a jump still doesn't capture the jump, because the entry fills at the
-    jump bar's open (post-jump close, pre-jump open — but the close already
-    reflects the jump).
+def test_intra_bar_jump_captured_at_next_bar_open_documents_limit():
+    """End-to-end variant documenting the engine's *fill-timing only*
+    contract: a signal that 'magically' fires the bar BEFORE a jump DOES
+    capture the jump in this fixture, because the entry fills at the jump
+    bar's open (which is still pre-jump in our setup) and then rides the
+    intra-bar move up to the post-jump close.
 
-    This pins the entry fill price to bar K+1's open, not bar K's close.
+    This pins the entry fill price to bar K+1's OPEN (not bar K's close,
+    and not bar K+1's close): the shift only enforces next-bar fill
+    timing — it is NOT a defense against caller-side forward-peeking.
+    True forward-peek protection is the caller's responsibility (closed-bar
+    indicator consumption).
     """
     df = _step_up_df(n=20, jump_bar=10, jump_pct=0.20)
     df["signal"] = 0
@@ -148,7 +157,7 @@ def test_regime_gate_uses_prior_bar_regime_not_current():
     assert result["total_trades"] == 1, (
         "Entry should pass: bar 9's regime is 'trending_up' (allowed). "
         "If 0 trades, the backtester is reading bar 10's regime (look-ahead) "
-        "instead of bar 9's. See backtester.py:447-452 regime shift."
+        "instead of bar 9's. See the regime-shift block in Backtester.run."
     )
 
 
@@ -172,7 +181,7 @@ def test_regime_gate_blocks_when_prior_bar_regime_disallows():
     assert result["total_trades"] == 0, (
         "Entry should be blocked by bar 9's 'ranging' regime. "
         "If a trade fired, the backtester is reading bar 10's regime "
-        "(look-ahead). See backtester.py:447-452 regime shift."
+        "(look-ahead). See the regime-shift block in Backtester.run."
     )
 
 
@@ -230,7 +239,8 @@ def test_forward_peek_signal_documents_caller_responsibility():
         f"Forward-peek signal should inflate returns past buy-and-hold "
         f"(documented limit). Got {final_pct:.1f}% vs BAH {buy_and_hold_pct:.1f}%. "
         f"If this assertion fails, the engine has gained forward-peek detection — "
-        f"update the test and the docstring at backtester.py:1-40."
+        f"update the test and the look-ahead contract docstring at the top of "
+        f"backtest/backtester.py."
     )
 
 

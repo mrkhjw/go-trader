@@ -13,17 +13,19 @@ To preserve that ordering in vectorized form, ``run()`` shifts every column
 that represents a *decision input* forward by one bar before the per-bar
 loop reads it, so row N+1 carries the decision values computed from bar N's
 closed data:
-  • ``signal``        — shift(1) at :421 → fills at row N+1's open at :495
-  • ``_open_action``  — shift(1) at :431 (open/close-split mode)
-  • ``_close_fraction`` (column-based) — shift(1) at :432
-  • ``regime``        — shift(1) post-injection (#730) so entries gate on
-                        bar N's regime, not bar N+1's.
+  • ``signal``         — shift(1) in the signal-normalization block; fills
+                         at row N+1's open in the per-bar entry block.
+  • ``_open_action``   — shift(1) in the open/close-split normalization block.
+  • ``_close_fraction`` (column-based) — shift(1) in the same block.
+  • ``regime``         — shift(1) in the regime-shift block (post-injection,
+                         #730) so entries gate on bar N's regime, not N+1's.
 
-Close evaluators run end-of-bar at :660-664 against bar N's mark and bar N's
-ATR. Their result becomes ``pending_close_fraction``, applied at row N+1's
-open — same alignment as the rest of the close pipeline. The current-bar ATR
-access at :815-821 is intentional and matches live: close evaluators see the
-ATR at decision time, not a frozen entry-time snapshot.
+Close evaluators run end-of-bar in ``_evaluate_close_strategies`` against
+bar N's mark and bar N's ATR. Their result becomes ``pending_close_fraction``,
+applied at row N+1's open — same alignment as the rest of the close pipeline.
+The current-bar ATR access in the ``market_dict`` build is intentional and
+matches live: close evaluators see the ATR at decision time, not a frozen
+entry-time snapshot.
 
 Indicator semantics
 -------------------
@@ -31,7 +33,7 @@ Indicator columns supplied by the caller (``atr``, ``regime``, ``adx``, etc.)
 represent bar N's value computed from data through bar N's close. The engine
 treats them as closed-bar quantities. Caller strategy scripts MUST NOT emit
 forward-peeking signals (e.g. ``signal = (close.shift(-1) > close)``); the
-shift(1) at :421 is the only look-ahead guard on the signal path and is
+signal ``shift(1)`` is the only look-ahead guard on the signal path and is
 defeated by upstream peeking. ``backtest/tests/test_backtester_lookahead.py``
 regression-tests the shift's effectiveness.
 
@@ -477,18 +479,21 @@ class Backtester:
             ensure_regime = _load_regime()
             ensure_regime(df, period=self.regime_period, adx_threshold=self.regime_adx_threshold)
 
-        # Shift regime to match the signal shift at :421. In live, the regime
-        # label is computed from bar N's closed data at the same moment as
-        # the signal; both gate the order that fills at bar N+1's open. Here
-        # the signal is already shifted forward by one row, so the regime
-        # consumed at row N+1 must be bar N's regime — not the regime that
-        # would only be knowable after bar N+1 closes. Without this shift,
-        # the entry gate at :520 reads a future bar's regime relative to the
-        # decision time, which is look-ahead bias (#730).
+        # Shift regime to match the signal shift in the signal-normalization
+        # block above. In live, the regime label is computed from bar N's
+        # closed data at the same moment as the signal; both gate the order
+        # that fills at bar N+1's open. Here the signal is already shifted
+        # forward by one row, so the regime consumed at row N+1 must be bar
+        # N's regime — not the regime that would only be knowable after bar
+        # N+1 closes. Without this shift, the entry gate in the per-bar loop
+        # reads a future bar's regime relative to the decision time, which
+        # is look-ahead bias (#730).
         #
-        # Empty/missing regime (e.g. row 0 after shift) → empty string, which
-        # fails the ``in allowed_regimes`` check and blocks the entry. That
-        # matches live behavior: no regime data, no entry.
+        # Empty/missing regime (e.g. row 0 after shift, or mid-series NaN
+        # rows from upstream gaps) → empty string after fillna, which fails
+        # the ``in allowed_regimes`` check and blocks the entry. That matches
+        # live behavior: no regime data, no entry. Intentional — do not
+        # "fix" the fillna to forward-fill or interpolate.
         if self.regime_enabled and "regime" in df.columns:
             df["regime"] = df["regime"].shift(1).fillna("")
 
@@ -876,9 +881,10 @@ class Backtester:
             # pending_close_fraction and applies at the NEXT bar's open. This
             # is the live ``tiered_tp_atr_live`` contract — see CLAUDE.md
             # "ATR for close evaluators". Entries, by contrast, gate on the
-            # PRIOR bar's regime/signal via the shifts at :421/:431/:452 —
-            # different timing for different decision points, both matching
-            # live.
+            # PRIOR bar's regime/signal via the shifts in the
+            # signal-normalization and regime-shift blocks at the top of
+            # ``run()`` — different timing for different decision points,
+            # both matching live.
             try:
                 live_atr = float(atr_series.loc[idx])
             except (KeyError, TypeError, ValueError):
