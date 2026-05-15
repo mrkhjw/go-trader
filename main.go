@@ -41,6 +41,9 @@ func main() {
 	if *dryRun {
 		log.Println("Running in dry-run mode — no real orders will be placed")
 		cfg.DryRun = true
+	} else {
+		// Extra warning so I don't forget I'm trading with real money
+		log.Println("WARNING: dry-run is disabled — REAL orders will be placed!")
 	}
 
 	// Initialize exchange client
