@@ -21,7 +21,8 @@ func main() {
 	// Parse command-line flags
 	configFile := flag.String("config", "config.yaml", "Path to configuration file")
 	showVersion := flag.Bool("version", false, "Print version and exit")
-	dryRun := flag.Bool("dry-run", false, "Run in simulation mode without placing real orders")
+	// Default dry-run to true so I don't accidentally place real orders while experimenting
+	dryRun := flag.Bool("dry-run", true, "Run in simulation mode without placing real orders")
 	flag.Parse()
 
 	if *showVersion {
